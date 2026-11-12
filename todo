@@ -40,6 +40,7 @@ BRIEFING_LIMIT = 30  # items listed in the b key's briefing prompt
 MENTION_PAGES = 5  # of 100 comments or reviews, read per mention thread checked
 MENTION_CACHE = "mentions.json"  # who mentioned you, per unread thread
 REBASED_LIMIT = 200  # commits a branch may have for the rebased-in check
+CHERRY_TIMEOUT = 3  # seconds the rebased-in check may take per branch
 
 UNREAD = "Unread"
 NEEDS_YOU = "Needs you"
@@ -1645,11 +1646,16 @@ def find_repositories(paths):
     return found
 
 
-def git_run(repository, *args):
-    """(whether git succeeded, its output)."""
-    result = subprocess.run(
-        ["git", "-C", repository, *args], capture_output=True, text=True
-    )
+def git_run(repository, *args, timeout=None):
+    """(whether git succeeded, its output); running past timeout seconds
+    kills it and counts as failing."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repository, *args], capture_output=True, text=True,
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return False, ""
     return result.returncode == 0, result.stdout
 
 
@@ -1690,13 +1696,15 @@ def inspect_repositories(pool, repositories):
 
 def default_branches(repository):
     """Each remote's default branch as a remote-tracking ref such as
-    origin/main, origin's first: <remote>/HEAD when it is set, else the
+    origin/main, origin's first: <remote>/HEAD when it names a branch that
+    exists (it can go stale when a remote renames master to main), else the
     remote's main or master."""
     found = []
     for remote in sorted(git(repository, "remote").split(), key=lambda name: name != "origin"):
         head = git(repository, "symbolic-ref", "-q", "--short",
                    f"refs/remotes/{remote}/HEAD").strip()
-        if head:
+        if head and git_run(repository, "rev-parse", "-q", "--verify",
+                            f"refs/remotes/{head}")[0]:
             found.append(head)
             continue
         for name in ("main", "master"):
@@ -1712,8 +1720,10 @@ def merged_into(repository, name, targets):
     branch name's changes, or None. A merged branch is in it; so is a rebased
     one, each of whose commits has an equivalent there (git cherry), unless
     it has merge commits, whose changes cherry cannot see, or more than
-    REBASED_LIMIT commits (cherry would take a while to say no). A branch is
-    not checked against its own name (main against origin/main)."""
+    REBASED_LIMIT commits (cherry would take a while to say no), or cherry
+    takes longer than CHERRY_TIMEOUT (it also reads the target's commits
+    since the branch forked, which can be many). A branch is not checked
+    against its own name (main against origin/main)."""
     for target in targets:
         if target.split("/", 1)[-1] == name:
             continue
@@ -1723,7 +1733,8 @@ def merged_into(repository, name, targets):
                   f"{target}..{name}").splitlines()
         if len(own) > REBASED_LIMIT or any(len(line.split()) > 2 for line in own):
             continue
-        succeeded, cherry = git_run(repository, "cherry", target, name)
+        succeeded, cherry = git_run(repository, "cherry", target, name,
+                                    timeout=CHERRY_TIMEOUT)
         if succeeded and not any(line.startswith("+") for line in cherry.splitlines()):
             return target
     return None
