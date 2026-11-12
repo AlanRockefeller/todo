@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -38,6 +39,8 @@ COUNT_MAX_AGE = 300  # seconds --count serves its cached line for
 BRIEFING_LIMIT = 30  # items listed in the b key's briefing prompt
 MENTION_PAGES = 5  # of 100 comments or reviews, read per mention thread checked
 MENTION_CACHE = "mentions.json"  # who mentioned you, per unread thread
+REBASED_LIMIT = 200  # commits a branch may have for the rebased-in check
+CHERRY_TIMEOUT = 3  # seconds the rebased-in check may take per branch
 
 UNREAD = "Unread"
 NEEDS_YOU = "Needs you"
@@ -1643,11 +1646,22 @@ def find_repositories(paths):
     return found
 
 
+def git_run(repository, *args, timeout=None):
+    """(whether git succeeded, its output); running past timeout seconds
+    kills it and counts as failing."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repository, *args], capture_output=True, text=True,
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return False, ""
+    return result.returncode == 0, result.stdout
+
+
 def git(repository, *args):
-    result = subprocess.run(
-        ["git", "-C", repository, *args], capture_output=True, text=True
-    )
-    return result.stdout if result.returncode == 0 else ""
+    succeeded, output = git_run(repository, *args)
+    return output if succeeded else ""
 
 
 def is_worktree(repository):
@@ -1680,10 +1694,64 @@ def inspect_repositories(pool, repositories):
         repositories, commons))
 
 
+def default_branches(repository):
+    """Each remote's default branch as a remote-tracking ref such as
+    origin/main, origin's first: <remote>/HEAD when it names a branch that
+    exists (it can go stale when a remote renames master to main), else the
+    remote's main or master."""
+    found = []
+    for remote in sorted(git(repository, "remote").split(), key=lambda name: name != "origin"):
+        head = git(repository, "symbolic-ref", "-q", "--short",
+                   f"refs/remotes/{remote}/HEAD").strip()
+        if head and git_run(repository, "rev-parse", "-q", "--verify",
+                            f"refs/remotes/{head}")[0]:
+            found.append(head)
+            continue
+        for name in ("main", "master"):
+            if git_run(repository, "rev-parse", "-q", "--verify",
+                       f"refs/remotes/{remote}/{name}")[0]:
+                found.append(f"{remote}/{name}")
+                break
+    return found
+
+
+def merged_into(repository, name, targets):
+    """The first of targets (remote default branches) that already has all of
+    branch name's changes, or None. A merged branch is in it; so is a rebased
+    one, each of whose commits has an equivalent there (git cherry), unless
+    it has merge commits, whose changes cherry cannot see, or more than
+    REBASED_LIMIT commits (cherry would take a while to say no), or cherry
+    takes longer than CHERRY_TIMEOUT (it also reads the target's commits
+    since the branch forked, which can be many). A branch is not checked
+    against its own name (main against origin/main)."""
+    for target in targets:
+        if target.split("/", 1)[-1] == name:
+            continue
+        if git_run(repository, "merge-base", "--is-ancestor", name, target)[0]:
+            return target
+        own = git(repository, "rev-list", "--parents", f"--max-count={REBASED_LIMIT + 1}",
+                  f"{target}..{name}").splitlines()
+        if len(own) > REBASED_LIMIT or any(len(line.split()) > 2 for line in own):
+            continue
+        succeeded, cherry = git_run(repository, "cherry", target, name,
+                                    timeout=CHERRY_TIMEOUT)
+        if succeeded and not any(line.startswith("+") for line in cherry.splitlines()):
+            return target
+    return None
+
+
+# What inspect_repository found in one checkout. problems lists merged
+# branches last; tidy says they are all there is (they only need deleting),
+# so the checkout sorts below the others. shared is whether it reports what
+# worktrees share (see inspect_repositories).
+Inspection = namedtuple("Inspection", "repository branch problems tidy shared")
+
+
 def inspect_repository(repository, shared=True):
     status = git(repository, "status", "--porcelain=v1", "--branch")
     if not status:
-        return repository, "?", [red("not a valid git repo (empty or broken .git)")]
+        return Inspection(repository, "?", [red("not a valid git repo (empty or broken .git)")],
+                          False, shared)
     lines = status.splitlines()
     head = lines[0][3:] if lines and lines[0].startswith("## ") else "?"
     if head.startswith("No commits yet on "):
@@ -1703,11 +1771,25 @@ def inspect_repository(repository, shared=True):
             parts.append(f"{untracked} untracked")
         problems.append(yellow(", ".join(parts)))
     if not shared:
-        return repository, branch, problems  # the rest is listed with another checkout
+        # The rest is listed with another checkout.
+        return Inspection(repository, branch, problems, False, shared)
 
     has_remote = bool(git(repository, "remote").strip())
     if not has_remote:
         problems.append(red("no remote"))
+
+    merged, targets = [], None
+
+    def merged_note(name, otherwise):
+        """"name: merged into origin/main" goes in merged; otherwise in problems."""
+        nonlocal targets
+        if targets is None:
+            targets = default_branches(repository)
+        target = merged_into(repository, name, targets)
+        if target:
+            merged.append(dim(f"{name}: merged into {target}"))
+        else:
+            problems.append(otherwise)
 
     for line in git(
         repository,
@@ -1717,35 +1799,39 @@ def inspect_repository(repository, shared=True):
     ).splitlines():
         name, upstream, track = (line.split("\t") + ["", ""])[:3]
         if upstream and track == "gone":
-            problems.append(dim(f"{name}: upstream deleted"))
+            merged_note(name, dim(f"{name}: upstream deleted, not merged"))
         elif upstream:
             for piece in track.split(", "):
                 if piece.startswith("ahead "):
                     count = int(piece.split()[1])
-                    problems.append(red(f"{name}: {count} unpushed"))
+                    merged_note(name, red(f"{name}: {count} unpushed"))
                 elif piece.startswith("behind ") and name == branch:
                     problems.append(dim(f"{name}: {piece}"))
         elif has_remote:
             count = git(repository, "rev-list", "--count", name, "--not", "--remotes")
             if count.strip() not in ("", "0"):
-                problems.append(red(f"{name}: {count.strip()} unpushed (no upstream)"))
+                merged_note(name, red(f"{name}: {count.strip()} unpushed (no upstream)"))
 
     stashes = len(git(repository, "stash", "list").splitlines())
     if stashes:
         problems.append(yellow(plural(stashes, "stash", "es")))
 
-    return repository, branch, problems
+    return Inspection(repository, branch, problems + merged, bool(merged) and not problems,
+                      shared)
 
 
 def display_local(paths):
     repositories = find_repositories(paths)
     with thread_pool(16) as pool:
         results = inspect_repositories(pool, repositories)
-    needing = [result for result in results if result[2]]
+    # Repos with nothing but merged branches to delete go last.
+    needing = sorted((result for result in results if result.problems),
+                     key=lambda result: result.tidy)
 
     heading(f"Local repos needing attention (of {len(results)} scanned)", len(needing))
-    for repository, branch, problems in needing:
-        print(f"  {bold(tilde(repository))} {dim('(' + branch + ')')}  {'; '.join(problems)}")
+    for result in needing:
+        print(f"  {bold(tilde(result.repository))} {dim('(' + result.branch + ')')}  "
+              f"{'; '.join(result.problems)}")
     return {"local repos needing attention": len(needing)}
 
 
@@ -1921,13 +2007,16 @@ def collect_items(args, paths, items, errors, light=False, results=None):
                       "activity": activity, "hidden": None, "kind": None,
                       "updated": None, "move": None, **extra})
 
-    for repository, branch, problems in local:
-        if problems:
-            # A dismissed repo returns when its problem summary changes.
-            add("Local repos needing attention", f"{tilde(repository)} ({branch})",
+    for result in local:
+        if result.problems:
+            repository, problems = result.repository, result.problems
+            # A dismissed repo returns when its problem summary changes. Repos
+            # with nothing but merged branches to delete sort last.
+            add("Local repos needing attention", f"{tilde(repository)} ({result.branch})",
                 local_prompt(problems), f"local:{repository}",
-                strip_ansi(f"{branch}: {'; '.join(problems)}"),
-                cwd=repository, meta="; ".join(problems), repository=repository)
+                strip_ansi(f"{result.branch}: {'; '.join(problems)}"),
+                cwd=repository, meta="; ".join(problems), repository=repository,
+                shared=result.shared, order=(1 if result.tidy else 0, len(items)))
 
     if not results:
         return results
@@ -2577,7 +2666,8 @@ class Menu:
             self.screen.clear()
         if item.get("repository") and item["visited"]:
             # Local state is cheap to recheck, so show what is left.
-            problems = inspect_repository(item["repository"])[2]
+            problems = inspect_repository(item["repository"],
+                                          shared=item.get("shared", True)).problems
             item["meta"] = "; ".join(problems) if problems else "clean"
             item["prompt"] = local_prompt(problems or ["nothing obvious"])
             self.message = f"{tilde(item['repository'])}: {item['meta']}"
