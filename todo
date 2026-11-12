@@ -199,6 +199,21 @@ def stale_flag(stamp):
     return f"stale {span(seconds)}"
 
 
+@contextlib.contextmanager
+def thread_pool(workers):
+    """A ThreadPoolExecutor for the main thread that, when Ctrl-C (or an
+    error) leaves the block, does not wait for the calls still running: they
+    can be GitHub requests with long timeouts. main then exits without
+    joining them."""
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        yield pool
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown()
+
+
 # ---------------------------------------------------------------- GitHub
 
 
@@ -464,9 +479,22 @@ def local_branches_on_other_repos(paths, login):
     return sorted(pairs)
 
 
-def other_branches_without_pull_requests(token, pairs):
+def other_branches_without_pull_requests(token, pairs, login):
     """Like branches_without_pull_requests, for branches you pushed to repos
-    you don't own (found through local clones)."""
+    you don't own (found through local clones). A branch you only track
+    there, such as an upstream release branch, is left out: one of the
+    newest 100 commits it has beyond the default branch must be yours (you
+    wrote or committed it)."""
+    me = login.lower()
+
+    def yours(comparison):
+        if not comparison:
+            return True  # nothing to compare with; list it as before
+        return any(
+            ((((commit or {}).get(role) or {}).get("user") or {}).get("login") or "").lower() == me
+            for commit in (comparison.get("commits") or {}).get("nodes") or []
+            for role in ("author", "committer"))
+
     def check(chunk):
         parts = []
         for index, (slug, branch) in enumerate(chunk):
@@ -475,7 +503,8 @@ def other_branches_without_pull_requests(token, pairs):
                 f"c{index}: repository(owner: {json.dumps(owner)}, "
                 f"name: {json.dumps(name)}) {{ nameWithOwner url "
                 f"defaultBranchRef {{ name compare(headRef: {json.dumps(branch)}) "
-                "{ aheadBy } } "
+                "{ aheadBy commits(last: 100) { nodes { "
+                "author { user { login } } committer { user { login } } } } } } "
                 f"ref(qualifiedName: {json.dumps('refs/heads/' + branch)}) {{ name "
                 "target { oid ... on Commit { committedDate } } "
                 "associatedPullRequests(first: 10) { nodes { state headRefOid } } } }"
@@ -492,8 +521,9 @@ def other_branches_without_pull_requests(token, pairs):
             if any(pull["state"] == "OPEN" or pull["headRefOid"] == ref["target"]["oid"]
                    for pull in pulls):
                 continue
-            ahead = (default.get("compare") or {}).get("aheadBy")
-            if ahead != 0:
+            comparison = default.get("compare")
+            ahead = (comparison or {}).get("aheadBy")
+            if ahead != 0 and yours(comparison):
                 found.append((repository, default["name"], ref, ahead))
         return found
 
@@ -1154,7 +1184,7 @@ def gather_github(paths, light=False):
         repositories = fetch_repositories(token)
         branches = safely(branches_without_pull_requests, token, repositories)
         others = safely(other_branches_without_pull_requests, token,
-                        local_branches_on_other_repos(paths, login))
+                        local_branches_on_other_repos(paths, login), login)
         if isinstance(branches, RuntimeError) or isinstance(others, RuntimeError):
             return repositories, branches if isinstance(branches, RuntimeError) else others
         return repositories, branches + others
@@ -1709,7 +1739,7 @@ def inspect_repository(repository, shared=True):
 
 def display_local(paths):
     repositories = find_repositories(paths)
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with thread_pool(16) as pool:
         results = inspect_repositories(pool, repositories)
     needing = [result for result in results if result[2]]
 
@@ -1856,7 +1886,7 @@ def collect_items(args, paths, items, errors, light=False, results=None):
     repositories = [] if light else find_repositories(paths)
     fallback = scan_fallback(paths)
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with thread_pool(16) as pool:
         github = (None if args.no_github or results is not None
                   else pool.submit(gather_github, paths, light=True) if light
                   else pool.submit(gather_github, paths))
@@ -2844,7 +2874,7 @@ def main():
         # Read only: the plain report hides what the menu hid but never
         # writes the state (the menu tidies it).
         state, _ = load_state()
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with thread_pool(1) as pool:
             paths = args.paths or DEFAULT_PATHS
             github = None if args.no_github else pool.submit(gather_github, paths)
             if not args.no_local:
@@ -2867,7 +2897,12 @@ def main():
     except BrokenPipeError:
         return 0
     except KeyboardInterrupt:
-        return 130
+        # Exit now: worker threads may still be waiting on GitHub, and a
+        # normal exit joins them first. (The menu has restored the terminal.)
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os._exit(130)
     return 0
 
 
