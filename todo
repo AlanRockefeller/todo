@@ -1412,9 +1412,11 @@ def load_state():
     with problem saying why (update_state keeps a copy before replacing it)."""
     data, problem = read_json("state.json")
     hidden = data.get("hidden") if isinstance(data, dict) else None
-    if data is not None and not isinstance(hidden, dict):
-        problem = "unexpected contents"
-    hidden = {key: entry for key, entry in (hidden or {}).items() if valid_entry(entry)}
+    if not isinstance(hidden, dict):
+        if data is not None:
+            problem = "unexpected contents"
+        hidden = {}
+    hidden = {key: entry for key, entry in hidden.items() if valid_entry(entry)}
     return {"version": 1, "hidden": hidden}, problem
 
 
@@ -1590,7 +1592,8 @@ def find_repositories(paths):
     found = []
 
     def walk(directory, depth):
-        if os.path.isdir(os.path.join(directory, ".git")):
+        # A directory for a checkout, a file for a linked worktree.
+        if os.path.exists(os.path.join(directory, ".git")):
             found.append(directory)
             return
         if depth >= MAX_DEPTH:
@@ -1617,7 +1620,37 @@ def git(repository, *args):
     return result.stdout if result.returncode == 0 else ""
 
 
-def inspect_repository(repository):
+def is_worktree(repository):
+    """A linked worktree's .git is a file naming the main repository's."""
+    return os.path.isfile(os.path.join(repository, ".git"))
+
+
+def common_git_dir(repository):
+    """The git directory a checkout shares with its other worktrees, or None."""
+    if not is_worktree(repository):
+        return os.path.realpath(os.path.join(repository, ".git"))
+    found = git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    return os.path.realpath(found) if found else None
+
+
+def inspect_repositories(pool, repositories):
+    """inspect_repository on each checkout. Worktrees share branches, stashes
+    and remotes, so one checkout of each repository reports those: the main
+    one, or the first linked worktree found when the main one is not. The
+    other worktrees report only their own uncommitted work."""
+    commons = list(pool.map(common_git_dir, repositories))
+    owners = {}
+    # sorted is stable, so worktrees keep their scan order after the main ones.
+    for repository, common in sorted(zip(repositories, commons),
+                                     key=lambda pair: is_worktree(pair[0])):
+        owners.setdefault(common, repository)
+    return list(pool.map(
+        lambda repository, common: inspect_repository(
+            repository, shared=common is None or owners[common] == repository),
+        repositories, commons))
+
+
+def inspect_repository(repository, shared=True):
     status = git(repository, "status", "--porcelain=v1", "--branch")
     if not status:
         return repository, "?", [red("not a valid git repo (empty or broken .git)")]
@@ -1639,6 +1672,8 @@ def inspect_repository(repository):
         if untracked:
             parts.append(f"{untracked} untracked")
         problems.append(yellow(", ".join(parts)))
+    if not shared:
+        return repository, branch, problems  # the rest is listed with another checkout
 
     has_remote = bool(git(repository, "remote").strip())
     if not has_remote:
@@ -1675,7 +1710,7 @@ def inspect_repository(repository):
 def display_local(paths):
     repositories = find_repositories(paths)
     with ThreadPoolExecutor(max_workers=16) as pool:
-        results = list(pool.map(inspect_repository, repositories))
+        results = inspect_repositories(pool, repositories)
     needing = [result for result in results if result[2]]
 
     heading(f"Local repos needing attention (of {len(results)} scanned)", len(needing))
@@ -1689,14 +1724,16 @@ def display_local(paths):
 
 def github_clones(pool, repositories):
     """Map lowercased owner/name to a local clone, preferring the clone whose
-    origin (rather than some other remote) points at that GitHub repo."""
+    origin (rather than some other remote) points at that GitHub repo, and a
+    main checkout over a linked worktree (often left on one PR's branch)."""
     def remotes(repository):
         found = []
+        worktree = is_worktree(repository)
         for line in git(repository, "config", "--get-regexp", r"^remote\..*\.url$").splitlines():
             key, _, url = line.partition(" ")
             match = GITHUB_REMOTE.search(url)
             if match:
-                found.append((key != "remote.origin.url",
+                found.append(((key != "remote.origin.url", worktree),
                               f"{match.group(1)}/{match.group(2)}".lower()))
         return repository, found
 
@@ -1825,7 +1862,7 @@ def collect_items(args, paths, items, errors, light=False, results=None):
                   else pool.submit(gather_github, paths))
         clones = github_clones(pool, repositories)
         local = ([] if args.no_local or light
-                 else list(pool.map(inspect_repository, repositories)))
+                 else inspect_repositories(pool, repositories))
         if github:
             try:
                 results = github.result()
